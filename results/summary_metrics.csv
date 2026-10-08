@@ -1,0 +1,5 @@
+policy,total_tasks,deadline_hit_rate_pct,avg_turnaround_s,avg_queue_delay_s,avg_energy_joules,fallback_rate_pct,sim_wall_time_s
+local_only,40,10.0,71.075,66.862,5.1,0.0,0.0
+greedy,40,97.5,2.257,0.038,24.9,0.0,0.0
+static_threshold,40,97.5,2.191,0.0,24.8,0.0,0.0
+slm_negotiation,40,97.5,2.411,0.134,14.4,0.0,285.68
