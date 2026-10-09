@@ -15,7 +15,7 @@ import pandas as pd
 
 from models import Tier, Task
 from simulation import MFCSimulator
-from llm_agent import SLMAgent, TIER_MODELS
+from llm_agent import SLMAgent, TIER_MODELS, CHAT_OPTIONS, KEEP_ALIVE
 from plotter import generate_evaluation_plots
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -84,7 +84,8 @@ def check_ollama():
     import ollama
     for tier, model in TIER_MODELS.items():
         try:
-            ollama.chat(model=model, messages=[{"role": "user", "content": "Reply with the word ok"}])
+            ollama.chat(model=model, messages=[{"role": "user", "content": "Reply with the word ok"}],
+                        options=CHAT_OPTIONS, keep_alive=KEEP_ALIVE)
             print(f"  [ok] {tier.value}: {model}")
         except Exception as e:
             print(f"  [FAIL] {tier.value}: {model} -> {e}")

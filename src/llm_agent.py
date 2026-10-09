@@ -18,6 +18,28 @@ TIER_MODELS: Dict[Tier, str] = {
 }
 
 
+CHAT_OPTIONS = {"temperature": 0.0, "num_ctx": 1024, "num_predict": 80}
+KEEP_ALIVE = "30m"
+
+
+def build_prompt(tier: Tier, task: Task, state: NodeState) -> str:
+    """Compact prompt (about 110 tokens). Shared by the agent and the latency profiler."""
+    allowed = (
+        '["execute_local", "offload_to_fog"]' if tier == Tier.MIST else
+        '["execute_local", "offload_to_cloud", "reject"]' if tier == Tier.FOG else
+        '["execute_local", "reject"]'
+    )
+    return (
+        f"You are the {tier.value.upper()} tier resource agent. Decide where to run one task.\n"
+        f"Node: cpu_free={state.cpu_free_pct:.0f}%, mem_free={state.mem_free_mb:.0f}MB, "
+        f"bandwidth={state.bandwidth_mbps:.0f}Mbps, queue={state.queue_length}\n"
+        f"Task: cpu={task.cpu_mflops:.0f}MFLOPS, mem={task.memory_mb:.0f}MB, "
+        f"data={task.data_size_mb:.1f}MB, deadline={task.deadline_s:.1f}s\n"
+        f"Allowed actions: {allowed}\n"
+        'Reply with JSON only: {"action": "<allowed action>", "reason": "<max 10 words>"}'
+    )
+
+
 class SLMAgent:
     """Agent at one tier backed by a local SLM, with schema validation and caching."""
 
@@ -111,33 +133,7 @@ class SLMAgent:
                 self.decision_cache[cache_key] = decision
             return decision
 
-        actions_allowed = (
-            '["execute_local", "offload_to_fog"]' if self.tier == Tier.MIST else
-            '["execute_local", "offload_to_cloud", "reject"]' if self.tier == Tier.FOG else
-            '["execute_local", "reject"]'
-        )
-        prompt = f"""You are the autonomous resource allocation agent for the {self.tier.value.upper()} tier.
-Node Status:
-- CPU Free: {state.cpu_free_pct:.1f}%
-- Memory Free: {state.mem_free_mb:.0f} MB
-- Bandwidth: {state.bandwidth_mbps:.1f} Mbps
-- Current Queue: {state.queue_length} tasks
-
-Incoming Task:
-- ID: {task.task_id}
-- CPU Demand: {task.cpu_mflops:.0f} MFLOPS
-- Memory Demand: {task.memory_mb:.0f} MB
-- Data Size: {task.data_size_mb:.1f} MB
-- Latency Deadline: {task.deadline_s:.1f} seconds
-
-Allowed actions: {actions_allowed}.
-Decide whether to execute locally, offload to next tier, or reject.
-Respond ONLY with a valid JSON object matching this schema:
-{{
-  "action": "<one of allowed actions>",
-  "target_tier": "<mist|fog|cloud or null>",
-  "reason": "<one sentence justification>"
-}}"""
+        prompt = build_prompt(self.tier, task, state)
 
         cacheable = True
         start_t = time.perf_counter()
@@ -146,7 +142,8 @@ Respond ONLY with a valid JSON object matching this schema:
                 model=self.model_name,
                 messages=[{"role": "user", "content": prompt}],
                 format="json",
-                options={"temperature": 0.0},
+                options=CHAT_OPTIONS,
+                keep_alive=KEEP_ALIVE,
             )
             elapsed = time.perf_counter() - start_t
             self.live_latencies.append(elapsed)
