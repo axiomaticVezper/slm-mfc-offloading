@@ -1,149 +1,183 @@
-﻿import os
-import random
-import time
-import pandas as pd
-import numpy as np
-from typing import List
+r"""Benchmark driver (upgraded).
 
-from models import Tier, Task, NodeState
+Usage (from the project root, venv active):
+    python src\main.py --seeds 3            # real Ollama run
+    python src\main.py --mock --seeds 2     # offline logic test, no Ollama (NOT for the report)
+"""
+import argparse
+import random
+import sys
+import time
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+
+from models import Tier, Task
 from simulation import MFCSimulator
-from llm_agent import SLMAgent
+from llm_agent import SLMAgent, TIER_MODELS
 from plotter import generate_evaluation_plots
 
-def generate_workload(num_tasks: int = 40, seed: int = 42) -> List[Task]:
-    """Generates heterogeneous IoT/Edge/Cloud workload."""
-    random.seed(seed)
-    np.random.seed(seed)
-    tasks = []
-    current_time = 0.0
+ROOT = Path(__file__).resolve().parent.parent
 
+# mean inter-arrival time (s) of the exponential arrival process
+SCENARIOS = {"normal": 0.8, "heavy_load": 0.3}
+
+CONFIGS = [
+    dict(name="local_only", policy="local_only"),
+    dict(name="greedy", policy="greedy"),
+    dict(name="static_threshold", policy="static_threshold"),
+    dict(name="always_fog", policy="always_fog"),
+    dict(name="slm_noguard", policy="slm_negotiation", guard=False, fault=0.0),
+    dict(name="slm_guard", policy="slm_negotiation", guard=True, fault=0.0),
+    dict(name="slm_noguard_faulty", policy="slm_negotiation", guard=False, fault=0.2),
+    dict(name="slm_guard_faulty", policy="slm_negotiation", guard=True, fault=0.2),
+]
+CHARGED = dict(name="slm_guard_charged", policy="slm_negotiation", guard=True, fault=0.0)
+
+
+def generate_workload(num_tasks, seed, mean_ia):
+    rnd = random.Random(seed)
+    rng = np.random.default_rng(seed)
+    tasks, t = [], 0.0
     for i in range(num_tasks):
-        # Poisson inter-arrival with mean rate 0.8s
-        inter_arrival = float(np.random.exponential(scale=0.8))
-        current_time += inter_arrival
-        
-        # 40% Light, 40% Medium, 20% Heavy
-        rand_profile = random.random()
-        if rand_profile < 0.40:
-            # Light IoT task
-            t = Task(
-                task_id=f"task_light_{i:02d}",
-                cpu_mflops=float(random.uniform(300, 750)),
-                memory_mb=float(random.uniform(50, 150)),
-                data_size_mb=float(random.uniform(0.1, 0.8)),
-                deadline_s=float(random.uniform(1.8, 3.0)),
-                arrival_time=current_time
-            )
-        elif rand_profile < 0.80:
-            # Medium Edge task
-            t = Task(
-                task_id=f"task_med_{i:02d}",
-                cpu_mflops=float(random.uniform(1500, 4200)),
-                memory_mb=float(random.uniform(250, 750)),
-                data_size_mb=float(random.uniform(2.0, 7.0)),
-                deadline_s=float(random.uniform(3.5, 6.0)),
-                arrival_time=current_time
-            )
+        t += float(rng.exponential(scale=mean_ia))
+        p = rnd.random()
+        if p < 0.40:
+            tasks.append(Task(task_id=f"task_light_{i:03d}", cpu_mflops=rnd.uniform(300, 750),
+                              memory_mb=rnd.uniform(50, 150), data_size_mb=rnd.uniform(0.1, 0.8),
+                              deadline_s=rnd.uniform(1.8, 3.0), arrival_time=t))
+        elif p < 0.80:
+            tasks.append(Task(task_id=f"task_med_{i:03d}", cpu_mflops=rnd.uniform(1500, 4200),
+                              memory_mb=rnd.uniform(250, 750), data_size_mb=rnd.uniform(2.0, 7.0),
+                              deadline_s=rnd.uniform(3.5, 6.0), arrival_time=t))
         else:
-            # Heavy Cloud task
-            t = Task(
-                task_id=f"task_heavy_{i:02d}",
-                cpu_mflops=float(random.uniform(9000, 22000)),
-                memory_mb=float(random.uniform(1200, 3500)),
-                data_size_mb=float(random.uniform(10.0, 25.0)),
-                deadline_s=float(random.uniform(7.0, 15.0)),
-                arrival_time=current_time
-            )
-        tasks.append(t)
+            tasks.append(Task(task_id=f"task_heavy_{i:03d}", cpu_mflops=rnd.uniform(9000, 22000),
+                              memory_mb=rnd.uniform(1200, 3500), data_size_mb=rnd.uniform(10.0, 25.0),
+                              deadline_s=rnd.uniform(7.0, 15.0), arrival_time=t))
     return tasks
 
-def main():
-    print("=" * 70)
-    print("Multi-Agent SLM-Based Adaptive Task Offloading & Negotiation")
-    print("=" * 70)
 
-    workload = generate_workload(num_tasks=40, seed=123)
-    print(f"Generated {len(workload)} heterogeneous tasks.")
-
-    # Initialize shared SLM agents (Mist: qwen2.5:0.5b, Fog: llama3.2:1b, Cloud: llama3.1:8b)
-    print("\nInitializing tier SLM agents...")
-    agents = {
-        Tier.MIST: SLMAgent(Tier.MIST, use_cache=True),
-        Tier.FOG: SLMAgent(Tier.FOG, use_cache=True),
-        Tier.CLOUD: SLMAgent(Tier.CLOUD, use_cache=True)
-    }
-
-    # Pre-warm Mist agent with a live query to verify Ollama integration
-    print("Running initial live SLM verification query with Mist agent...")
-    sample_state = NodeState(
-        tier=Tier.MIST,
-        cpu_free_pct=60.0,
-        mem_free_mb=350.0,
-        bandwidth_mbps=30.0,
-        queue_length=1
+def compute_metrics(df):
+    n = len(df)
+    ex = df[df.executed_tier.notna()]
+    share = lambda tier: float((ex.executed_tier == tier).sum()) / n * 100
+    has = len(ex) > 0
+    return dict(
+        n_tasks=n,
+        deadline_hit_rate_pct=df.met_deadline.mean() * 100,
+        avg_turnaround_s=ex.total_turnaround.mean() if has else np.nan,
+        p95_turnaround_s=ex.total_turnaround.quantile(0.95) if has else np.nan,
+        avg_queue_delay_s=ex.queue_delay.mean() if has else np.nan,
+        avg_energy_j=ex.energy_joules.mean() if has else np.nan,
+        rejected_pct=(n - len(ex)) / n * 100,
+        mem_violation_pct=df.mem_violation.mean() * 100,
+        overloaded_pct=float((ex.queue_delay > 1.0).sum()) / n * 100,   # queue wait > 1 s
+        fallback_pct=df.fallback_used.mean() * 100,
+        guard_override_pct=df.guard_override.mean() * 100,
+        mist_pct=share("mist"), fog_pct=share("fog"), cloud_pct=share("cloud"),
+        mean_decision_latency_s=df.decision_latency_s.mean(),
     )
-    init_dec = agents[Tier.MIST].decide(workload[0], sample_state, force_live_query=True)
-    print(f"Mist initial decision: {init_dec.action.value} (target={init_dec.target_tier}, latency={init_dec.decision_latency_s:.2f}s)")
-    print(f"Reason: {init_dec.reason}")
 
-    policies = ["local_only", "greedy", "static_threshold", "slm_negotiation"]
-    all_results = []
-    summary_rows = []
 
-    for pol in policies:
-        print(f"\n---> Running Simulation Policy: [{pol}]")
-        sim = MFCSimulator(policy=pol, agents=agents)
-        sim.env.process(sim.run_workload(workload))
-        start_wall = time.perf_counter()
-        sim.env.run()
-        wall_time = time.perf_counter() - start_wall
+def check_ollama():
+    import ollama
+    for tier, model in TIER_MODELS.items():
+        try:
+            ollama.chat(model=model, messages=[{"role": "user", "content": "Reply with the word ok"}])
+            print(f"  [ok] {tier.value}: {model}")
+        except Exception as e:
+            print(f"  [FAIL] {tier.value}: {model} -> {e}")
+            print("Fix: start Ollama and run `ollama pull " + model + "`. Aborting so no results are polluted by fallbacks.")
+            sys.exit(1)
 
-        df_pol = pd.DataFrame([r.model_dump() for r in sim.results])
-        all_results.append(df_pol)
 
-        total_tasks = len(df_pol)
-        met_count = int(df_pol["met_deadline"].sum())
-        hit_rate = (met_count / total_tasks) * 100.0
-        avg_turnaround = float(df_pol["total_turnaround"].mean())
-        avg_energy = float(df_pol["energy_joules"].mean())
-        avg_queue = float(df_pol["queue_delay"].mean())
-        fallback_rate = (float(df_pol["fallback_used"].sum()) / total_tasks) * 100.0
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--seeds", type=int, default=3)
+    ap.add_argument("--num-tasks", type=int, default=60)
+    ap.add_argument("--mock", action="store_true", help="offline logic test with a fake agent")
+    ap.add_argument("--fresh-cache", action="store_true", help="ignore saved SLM decision cache")
+    args = ap.parse_args()
 
-        summary_rows.append({
-            "policy": pol,
-            "total_tasks": total_tasks,
-            "deadline_hit_rate_pct": round(hit_rate, 1),
-            "avg_turnaround_s": round(avg_turnaround, 3),
-            "avg_queue_delay_s": round(avg_queue, 3),
-            "avg_energy_joules": round(avg_energy, 1),
-            "fallback_rate_pct": round(fallback_rate, 1),
-            "sim_wall_time_s": round(wall_time, 2)
-        })
-        print(f"Policy [{pol}] Completed | Hit Rate: {hit_rate:.1f}% | Avg Turnaround: {avg_turnaround:.2f}s | Avg Energy: {avg_energy:.1f}J")
+    suffix = "_mock" if args.mock else ""
+    results_dir, figures_dir = ROOT / f"results{suffix}", ROOT / f"figures{suffix}"
+    results_dir.mkdir(exist_ok=True)
+    figures_dir.mkdir(exist_ok=True)
+    seeds = [101 + i for i in range(args.seeds)]
 
-    summary_df = pd.DataFrame(summary_rows)
-    detailed_df = pd.concat(all_results, ignore_index=True)
-
-    # Save results
-    results_dir = os.path.expanduser(r"~\DA2_MFC\results")
-    figures_dir = os.path.expanduser(r"~\DA2_MFC\figures")
-    os.makedirs(results_dir, exist_ok=True)
-    os.makedirs(figures_dir, exist_ok=True)
-
-    summary_df.to_csv(os.path.join(results_dir, "summary_metrics.csv"), index=False)
-    detailed_df.to_csv(os.path.join(results_dir, "detailed_tasks.csv"), index=False)
-
-    print("\nGenerating evaluation plots in figures/...")
-    generate_evaluation_plots(summary_df, detailed_df, figures_dir)
-
-    print("\n" + "=" * 70)
-    print("FINAL BENCHMARK COMPARISON TABLE")
     print("=" * 70)
-    print(summary_df.to_string(index=False))
+    print("Multi-Agent SLM Task Offloading: guarded negotiation benchmark" + (" [MOCK AGENTS]" if args.mock else ""))
     print("=" * 70)
-    print(f"\nArtifacts saved:")
-    print(f"- Summary CSV: {os.path.join(results_dir, 'summary_metrics.csv')}")
-    print(f"- Figures: {figures_dir}")
+
+    if not args.mock:
+        print("Checking Ollama models (this also loads them into memory)...")
+        check_ollama()
+
+    agents = {t: SLMAgent(t, use_cache=True, mock=args.mock) for t in Tier}
+    if not args.mock and not args.fresh_cache:
+        for t, a in agents.items():
+            a.load_cache(results_dir / f"slm_cache_{t.value}.json")
+
+    def save_caches():
+        if not args.mock:
+            for t, a in agents.items():
+                a.save_cache(results_dir / f"slm_cache_{t.value}.json")
+
+    run_rows, task_frames = [], []
+
+    def run_one(scenario, seed, cfg, tasks, inference_cost=None):
+        sim = MFCSimulator(policy=cfg["policy"], agents=agents, use_guard=cfg.get("guard", False),
+                           fault_rate=cfg.get("fault", 0.0), seed=seed, inference_cost=inference_cost)
+        res = sim.run(tasks)
+        df = pd.DataFrame([r.model_dump(mode="json") for r in res])
+        df["scenario"], df["seed"], df["config"] = scenario, seed, cfg["name"]
+        task_frames.append(df)
+        run_rows.append(dict(scenario=scenario, seed=seed, config=cfg["name"], **compute_metrics(df)))
+
+    t0 = time.perf_counter()
+    for scenario, ia in SCENARIOS.items():
+        for seed in seeds:
+            tasks = generate_workload(args.num_tasks, seed, ia)
+            for cfg in CONFIGS:
+                run_one(scenario, seed, cfg, tasks)
+            save_caches()
+            print(f"[{time.perf_counter() - t0:7.1f}s] scenario={scenario} seed={seed} done "
+                  f"(live SLM calls so far: {sum(len(a.live_latencies) for a in agents.values())})")
+
+    # Phase 2: charge measured per-tier inference time to simulated time
+    cost = {t: (float(np.mean(a.live_latencies)) if a.live_latencies else 0.0) for t, a in agents.items()}
+    print("Mean live inference latency per tier (s):", {t.value: round(v, 2) for t, v in cost.items()})
+    for scenario, ia in SCENARIOS.items():
+        for seed in seeds:
+            run_one(scenario, seed, CHARGED, generate_workload(args.num_tasks, seed, ia), inference_cost=cost)
+
+    runs_df = pd.DataFrame(run_rows)
+    tasks_df = pd.concat(task_frames, ignore_index=True)
+
+    summary = runs_df.drop(columns=["seed"]).groupby(["scenario", "config"]).agg(["mean", "std"])
+    summary.columns = [f"{m}_{s}" for m, s in summary.columns]
+    summary = summary.reset_index().round(3)
+
+    lat = pd.DataFrame([dict(
+        tier=t.value, model=a.model_name, total_queries=a.total_queries, cache_hits=a.cache_hits,
+        live_calls=len(a.live_latencies), format_fallbacks=a.fallback_count,
+        mean_live_latency_s=float(np.mean(a.live_latencies)) if a.live_latencies else np.nan,
+        p95_live_latency_s=float(np.percentile(a.live_latencies, 95)) if a.live_latencies else np.nan,
+    ) for t, a in agents.items()])
+
+    runs_df.round(4).to_csv(results_dir / "run_metrics.csv", index=False)
+    summary.to_csv(results_dir / "summary_metrics.csv", index=False)
+    tasks_df.to_csv(results_dir / "detailed_tasks.csv", index=False)
+    lat.to_csv(results_dir / "slm_latency_stats.csv", index=False)
+    generate_evaluation_plots(runs_df, figures_dir)
+
+    show = ["scenario", "config", "deadline_hit_rate_pct_mean", "avg_turnaround_s_mean", "avg_energy_j_mean",
+            "mem_violation_pct_mean", "overloaded_pct_mean", "guard_override_pct_mean"]
+    print("\n" + summary[show].to_string(index=False))
+    print("\nSLM latency / cache stats:\n" + lat.to_string(index=False))
+    print(f"\nSaved to: {results_dir}  and  {figures_dir}")
+
 
 if __name__ == "__main__":
     main()

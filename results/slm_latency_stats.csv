@@ -1,0 +1,4 @@
+tier,model,total_queries,cache_hits,live_calls,format_fallbacks,mean_live_latency_s,p95_live_latency_s
+mist,qwen2.5:0.5b,200,200,0,0,,
+fog,llama3.2:1b,184,184,0,0,,
+cloud,llama3.1:8b,17,17,0,0,,
